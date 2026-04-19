@@ -660,6 +660,7 @@ class AIAgent:
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
         persist_session: bool = True,
+        extra_headers: Dict[str, str] = None,
     ):
         """
         Initialize the AI Agent.
@@ -728,6 +729,7 @@ class AIAgent:
         self.pass_session_id = pass_session_id
         self.persist_session = persist_session
         self._credential_pool = credential_pool
+        self._extra_headers = extra_headers or {}  # 用户自定义 HTTP headers，传递给 OpenAI client
         self.log_prefix_chars = log_prefix_chars
         self.log_prefix = f"{log_prefix} " if log_prefix else ""
         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
@@ -1096,6 +1098,15 @@ class AIAgent:
                         "configuration."
                     )
             
+            # 合并用户自定义的 extra_headers（来自 config.yaml 中的 custom_providers
+            # 或 providers 配置）。这些 headers 会作为 default_headers 传递给
+            # OpenAI client，在每次请求时自动附加。
+            if self._extra_headers:
+                existing_headers = client_kwargs.get("default_headers") or {}
+                merged = dict(existing_headers)
+                merged.update(self._extra_headers)
+                client_kwargs["default_headers"] = merged
+
             self._client_kwargs = client_kwargs  # stored for rebuilding after interrupt
 
             # Enable fine-grained tool streaming for Claude on OpenRouter.
@@ -1781,6 +1792,8 @@ class AIAgent:
                 "api_key": effective_key,
                 "base_url": effective_base,
             }
+            # 应用 provider 特定的 headers 和用户自定义的 extra_headers
+            self._apply_client_headers_for_base_url(effective_base)
             self.client = self._create_openai_client(
                 dict(self._client_kwargs),
                 reason="switch_model",
@@ -5247,6 +5260,13 @@ class AIAgent:
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
         else:
             self._client_kwargs.pop("default_headers", None)
+
+        # 重新合并用户自定义的 extra_headers（provider 切换后仍需保留）
+        if self._extra_headers:
+            existing = self._client_kwargs.get("default_headers") or {}
+            merged = dict(existing)
+            merged.update(self._extra_headers)
+            self._client_kwargs["default_headers"] = merged
 
     def _swap_credential(self, entry) -> None:
         runtime_key = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", "")

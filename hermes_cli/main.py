@@ -2495,6 +2495,28 @@ def _model_flow_custom(config):
         # Prompt for a display name — shown in the provider menu on future runs
         default_name = _auto_provider_name(effective_url)
         display_name = input(f"Display name [{default_name}]: ").strip() or default_name
+
+        # Prompt for extra HTTP headers — useful for endpoints that require
+        # custom authentication tokens or routing hints beyond the API key.
+        extra_headers = {}
+        add_headers = input("Add custom HTTP headers? [y/N]: ").strip().lower()
+        if add_headers in ("y", "yes"):
+            print("  Enter headers as 'Header-Name: value' (one per line, blank line to finish):")
+            while True:
+                header_line = input("  > ").strip()
+                if not header_line:
+                    break
+                if ":" not in header_line:
+                    print("    Invalid format — use 'Header-Name: value'")
+                    continue
+                h_name, h_value = header_line.split(":", 1)
+                h_name = h_name.strip()
+                h_value = h_value.strip()
+                if h_name:
+                    extra_headers[h_name] = h_value
+                    print(f"    Added: {h_name}")
+            if extra_headers:
+                print(f"  {len(extra_headers)} custom header(s) configured.")
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
         return
@@ -2527,6 +2549,10 @@ def _model_flow_custom(config):
         if effective_key:
             model["api_key"] = effective_key
         model.pop("api_mode", None)  # let runtime auto-detect from URL
+        if extra_headers:
+            model["extra_headers"] = extra_headers
+        else:
+            model.pop("extra_headers", None)
         save_config(cfg)
         deactivate_provider()
 
@@ -2560,6 +2586,7 @@ def _model_flow_custom(config):
         model_name or "",
         context_length=context_length,
         name=display_name,
+        extra_headers=extra_headers if extra_headers else None,
     )
 
 
@@ -2585,7 +2612,8 @@ def _auto_provider_name(base_url: str) -> str:
 
 
 def _save_custom_provider(
-    base_url, api_key="", model="", context_length=None, name=None
+    base_url, api_key="", model="", context_length=None, name=None,
+    extra_headers=None,
 ):
     """Save a custom endpoint to custom_providers in config.yaml.
 
@@ -2632,6 +2660,8 @@ def _save_custom_provider(
         entry["model"] = model
     if model and context_length:
         entry["models"] = {model: {"context_length": context_length}}
+    if extra_headers and isinstance(extra_headers, dict):
+        entry["extra_headers"] = extra_headers
 
     providers.append(entry)
     cfg["custom_providers"] = providers

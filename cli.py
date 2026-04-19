@@ -2854,6 +2854,9 @@ class HermesCLI:
         if runtime_model and isinstance(runtime_model, str):
             self.model = runtime_model
 
+        # 存储用户自定义的 extra_headers（来自 custom_providers 配置）
+        self._runtime_extra_headers = runtime.get("extra_headers") or {}
+
         # If model is still empty (e.g. user ran `hermes auth add openai-codex`
         # without `hermes model`), fall back to the provider's first catalog
         # model so the API call doesn't fail with "model must be non-empty".
@@ -2994,6 +2997,7 @@ class HermesCLI:
                 acp_command=runtime.get("command"),
                 acp_args=runtime.get("args"),
                 credential_pool=runtime.get("credential_pool"),
+                extra_headers=getattr(self, "_runtime_extra_headers", None) or {},
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,

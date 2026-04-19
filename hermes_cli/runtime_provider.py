@@ -304,12 +304,16 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                 # Found match by provider key
                 base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                 if base_url:
-                    return {
+                    result = {
                         "name": entry.get("name", ep_name),
                         "base_url": base_url.strip(),
                         "api_key": resolved_api_key,
                         "model": entry.get("default_model", ""),
                     }
+                    extra_headers = entry.get("extra_headers")
+                    if isinstance(extra_headers, dict) and extra_headers:
+                        result["extra_headers"] = {str(k): str(v) for k, v in extra_headers.items()}
+                    return result
             # Also check the 'name' field if present
             display_name = entry.get("name", "")
             if display_name:
@@ -318,12 +322,16 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     # Found match by display name
                     base_url = entry.get("api") or entry.get("url") or entry.get("base_url") or ""
                     if base_url:
-                        return {
+                        result = {
                             "name": display_name,
                             "base_url": base_url.strip(),
                             "api_key": resolved_api_key,
                             "model": entry.get("default_model", ""),
                         }
+                        extra_headers = entry.get("extra_headers")
+                        if isinstance(extra_headers, dict) and extra_headers:
+                            result["extra_headers"] = {str(k): str(v) for k, v in extra_headers.items()}
+                        return result
 
     # Fall back to custom_providers: list (legacy format)
     custom_providers = config.get("custom_providers")
@@ -369,6 +377,9 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         model_name = str(entry.get("model", "") or "").strip()
         if model_name:
             result["model"] = model_name
+        extra_headers = entry.get("extra_headers")
+        if isinstance(extra_headers, dict) and extra_headers:
+            result["extra_headers"] = {str(k): str(v) for k, v in extra_headers.items()}
         return result
 
     return None
@@ -423,6 +434,10 @@ def _resolve_named_custom_runtime(
     # provider name differs from the actual model string the API expects.
     if custom_provider.get("model"):
         result["model"] = custom_provider["model"]
+    # Propagate extra_headers for OpenAI-compatible endpoints that require
+    # custom HTTP headers (e.g. authentication tokens, routing hints).
+    if custom_provider.get("extra_headers"):
+        result["extra_headers"] = custom_provider["extra_headers"]
     return result
 
 
@@ -512,7 +527,7 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
-    return {
+    result = {
         "provider": effective_provider,
         "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
         or _detect_api_mode_for_url(base_url)
@@ -521,6 +536,11 @@ def _resolve_openrouter_runtime(
         "api_key": api_key,
         "source": source,
     }
+    # 从 model 配置中读取 extra_headers（用户可在 config.yaml 的 model 部分配置）
+    cfg_extra_headers = model_cfg.get("extra_headers")
+    if isinstance(cfg_extra_headers, dict) and cfg_extra_headers:
+        result["extra_headers"] = {str(k): str(v) for k, v in cfg_extra_headers.items()}
+    return result
 
 
 def _resolve_explicit_runtime(
@@ -664,6 +684,29 @@ def resolve_runtime_provider(
     explicit_base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution."""
+    runtime = _resolve_runtime_provider_core(
+        requested=requested,
+        explicit_api_key=explicit_api_key,
+        explicit_base_url=explicit_base_url,
+    )
+    # ── 统一注入 extra_headers ──────────────────────────────────────────
+    # 无论走哪条 provider 解析路径，都从 model 配置中读取 extra_headers
+    # 并注入到 runtime dict 中（如果 runtime 中尚未包含 extra_headers）。
+    if "extra_headers" not in runtime or not runtime["extra_headers"]:
+        model_cfg = _get_model_config()
+        cfg_extra_headers = model_cfg.get("extra_headers")
+        if isinstance(cfg_extra_headers, dict) and cfg_extra_headers:
+            runtime["extra_headers"] = {str(k): str(v) for k, v in cfg_extra_headers.items()}
+    return runtime
+
+
+def _resolve_runtime_provider_core(
+    *,
+    requested: Optional[str] = None,
+    explicit_api_key: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Core implementation of resolve_runtime_provider."""
     requested_provider = resolve_requested_provider(requested)
 
     custom_runtime = _resolve_named_custom_runtime(
