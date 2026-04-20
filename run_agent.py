@@ -48,6 +48,10 @@ from hermes_constants import get_hermes_home
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_cli.timeouts import (
+    get_provider_request_timeout,
+    get_provider_stale_timeout,
+)
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -157,6 +161,20 @@ class _SafeWriter:
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+def _get_proxy_from_env() -> Optional[str]:
+    """Read proxy URL from environment variables.
+
+    Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY (and lowercase variants) in order.
+    Returns the first valid proxy URL found, or None if no proxy is configured.
+    """
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                "https_proxy", "http_proxy", "all_proxy"):
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return None
 
 
 def _install_safe_stdio() -> None:
@@ -353,6 +371,89 @@ def _sanitize_surrogates(text: str) -> str:
     return text
 
 
+def _chat_content_to_responses_parts(content: Any) -> List[Dict[str, Any]]:
+    """Convert chat-style multimodal content to Responses API input parts.
+
+    Input:  ``[{"type":"text"|"image_url", ...}]`` (native OpenAI Chat format)
+    Output: ``[{"type":"input_text"|"input_image", ...}]`` (Responses format)
+
+    Returns an empty list when ``content`` is not a list or contains no
+    recognized parts — callers fall back to the string path.
+    """
+    if not isinstance(content, list):
+        return []
+    converted: List[Dict[str, Any]] = []
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                converted.append({"type": "input_text", "text": part})
+            continue
+        if not isinstance(part, dict):
+            continue
+        ptype = str(part.get("type") or "").strip().lower()
+        if ptype in {"text", "input_text", "output_text"}:
+            text = part.get("text")
+            if isinstance(text, str) and text:
+                converted.append({"type": "input_text", "text": text})
+            continue
+        if ptype in {"image_url", "input_image"}:
+            image_ref = part.get("image_url")
+            detail = part.get("detail")
+            if isinstance(image_ref, dict):
+                url = image_ref.get("url")
+                detail = image_ref.get("detail", detail)
+            else:
+                url = image_ref
+            if not isinstance(url, str) or not url:
+                continue
+            image_part: Dict[str, Any] = {"type": "input_image", "image_url": url}
+            if isinstance(detail, str) and detail.strip():
+                image_part["detail"] = detail.strip()
+            converted.append(image_part)
+    return converted
+
+
+def _summarize_user_message_for_log(content: Any) -> str:
+    """Return a short text summary of a user message for logging/trajectory.
+
+    Multimodal messages arrive as a list of ``{type:"text"|"image_url", ...}``
+    parts from the API server.  Logging, spinner previews, and trajectory
+    files all want a plain string — this helper extracts the first chunk of
+    text and notes any attached images.  Returns an empty string for empty
+    lists and ``str(content)`` for unexpected scalar types.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_bits: List[str] = []
+        image_count = 0
+        for part in content:
+            if isinstance(part, str):
+                if part:
+                    text_bits.append(part)
+                continue
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type") or "").strip().lower()
+            if ptype in {"text", "input_text", "output_text"}:
+                text = part.get("text")
+                if isinstance(text, str) and text:
+                    text_bits.append(text)
+            elif ptype in {"image_url", "input_image"}:
+                image_count += 1
+        summary = " ".join(text_bits).strip()
+        if image_count:
+            note = f"[{image_count} image{'s' if image_count != 1 else ''}]"
+            summary = f"{note} {summary}" if summary else note
+        return summary
+    try:
+        return str(content)
+    except Exception:
+        return ""
+
+
 def _sanitize_structure_surrogates(payload: Any) -> bool:
     """Replace surrogate code points in nested dict/list payloads in-place.
 
@@ -452,6 +553,71 @@ def _sanitize_messages_surrogates(messages: list) -> bool:
                 if _sanitize_structure_surrogates(value):
                     found = True
     return found
+
+
+def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
+    """Attempt to repair malformed tool_call argument JSON.
+
+    Models like GLM-5.1 via Ollama can produce truncated JSON, trailing
+    commas, Python ``None``, etc.  The API proxy rejects these with HTTP 400
+    "invalid tool call arguments".  This function applies common repairs;
+    if all fail it returns ``"{}"`` so the request succeeds (better than
+    crashing the session).  All repairs are logged at WARNING level.
+    """
+    raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
+
+    # Fast-path: empty / whitespace-only -> empty object
+    if not raw_stripped:
+        logger.warning("Sanitized empty tool_call arguments for %s", tool_name)
+        return "{}"
+
+    # Python-literal None -> normalise to {}
+    if raw_stripped == "None":
+        logger.warning("Sanitized Python-None tool_call arguments for %s", tool_name)
+        return "{}"
+
+    # Attempt common JSON repairs
+    fixed = raw_stripped
+    # 1. Strip trailing commas before } or ]
+    fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
+    # 2. Close unclosed structures
+    open_curly = fixed.count('{') - fixed.count('}')
+    open_bracket = fixed.count('[') - fixed.count(']')
+    if open_curly > 0:
+        fixed += '}' * open_curly
+    if open_bracket > 0:
+        fixed += ']' * open_bracket
+    # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
+    for _ in range(50):
+        try:
+            json.loads(fixed)
+            break
+        except json.JSONDecodeError:
+            if fixed.endswith('}') and fixed.count('}') > fixed.count('{'):
+                fixed = fixed[:-1]
+            elif fixed.endswith(']') and fixed.count(']') > fixed.count('['):
+                fixed = fixed[:-1]
+            else:
+                break
+
+    try:
+        json.loads(fixed)
+        logger.warning(
+            "Repaired malformed tool_call arguments for %s: %s → %s",
+            tool_name, raw_stripped[:80], fixed[:80],
+        )
+        return fixed
+    except json.JSONDecodeError:
+        pass
+
+    # Last resort: replace with empty object so the API request doesn't
+    # crash the entire session.
+    logger.warning(
+        "Unrepairable tool_call arguments for %s — "
+        "replaced with empty object (was: %s)",
+        tool_name, raw_stripped[:80],
+    )
+    return "{}"
 
 
 def _strip_non_ascii(text: str) -> str:
@@ -879,13 +1045,15 @@ class AIAgent:
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         self._force_ascii_payload = False
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
-        is_openrouter = self._is_openrouter_url()
-        is_claude = "claude" in self.model.lower()
-        is_native_anthropic = self.api_mode == "anthropic_messages" and self.provider == "anthropic"
-        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
+        # Anthropic prompt caching: auto-enabled for Claude models on native
+        # Anthropic, OpenRouter, and third-party gateways that speak the
+        # Anthropic protocol (``api_mode == 'anthropic_messages'``). Reduces
+        # input costs by ~75% on multi-turn conversations. Uses system_and_3
+        # strategy (4 breakpoints). See ``_anthropic_prompt_cache_policy``
+        # for the layout-vs-transport decision.
+        self._use_prompt_caching, self._use_native_cache_layout = (
+            self._anthropic_prompt_cache_policy()
+        )
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
         
         # Iteration budget: the LLM is only notified when it actually exhausts
@@ -965,6 +1133,12 @@ class AIAgent:
         self._anthropic_client = None
         self._is_anthropic_oauth = False
 
+        # Resolve per-provider / per-model request timeout once up front so
+        # every client construction path below (Anthropic native, OpenAI-wire,
+        # router-based implicit auth) can apply it consistently.  Bedrock
+        # Claude uses its own timeout path and is not covered here.
+        _provider_timeout = get_provider_request_timeout(self.provider, self.model)
+
         if self.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
             # Bedrock + Claude → use AnthropicBedrock SDK for full feature parity
@@ -994,9 +1168,16 @@ class AIAgent:
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = base_url
+                # Only mark the session as OAuth-authenticated when the token
+                # genuinely belongs to native Anthropic.  Third-party providers
+                # (MiniMax, Kimi, GLM, LiteLLM proxies) that accept the
+                # Anthropic protocol must never trip OAuth code paths — doing
+                # so injects Claude-Code identity headers and system prompts
+                # that cause 401/403 on their endpoints.  Guards #1739 and
+                # the third-party identity-injection bug.
                 from agent.anthropic_adapter import _is_oauth_token as _is_oat
-                self._is_anthropic_oauth = _is_oat(effective_key)
-                self._anthropic_client = build_anthropic_client(effective_key, base_url)
+                self._is_anthropic_oauth = _is_oat(effective_key) if _is_native_anthropic else False
+                self._anthropic_client = build_anthropic_client(effective_key, base_url, timeout=_provider_timeout)
                 # No OpenAI client needed for Anthropic mode
                 self.client = None
                 self._client_kwargs = {}
@@ -1036,6 +1217,8 @@ class AIAgent:
                 # Explicit credentials from CLI/gateway — construct directly.
                 # The runtime provider resolver already handled auth for us.
                 client_kwargs = {"api_key": api_key, "base_url": base_url}
+                if _provider_timeout is not None:
+                    client_kwargs["timeout"] = _provider_timeout
                 if self.provider == "copilot-acp":
                     client_kwargs["command"] = self.acp_command
                     client_kwargs["args"] = self.acp_args
@@ -1056,6 +1239,9 @@ class AIAgent:
                     }
                 elif "portal.qwen.ai" in effective_base.lower():
                     client_kwargs["default_headers"] = _qwen_portal_headers()
+                elif "chatgpt.com" in effective_base.lower():
+                    from agent.auxiliary_client import _codex_cloudflare_headers
+                    client_kwargs["default_headers"] = _codex_cloudflare_headers(api_key)
             else:
                 # No explicit creds — use the centralized provider router
                 from agent.auxiliary_client import resolve_provider_client
@@ -1066,6 +1252,8 @@ class AIAgent:
                         "api_key": _routed_client.api_key,
                         "base_url": str(_routed_client.base_url),
                     }
+                    if _provider_timeout is not None:
+                        client_kwargs["timeout"] = _provider_timeout
                     # Preserve any default_headers the router set
                     if hasattr(_routed_client, '_default_headers') and _routed_client._default_headers:
                         client_kwargs["default_headers"] = dict(_routed_client._default_headers)
@@ -1210,7 +1398,12 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
+            if self._use_native_cache_layout and self.provider == "anthropic":
+                source = "native Anthropic"
+            elif self._use_native_cache_layout:
+                source = "Anthropic-compatible endpoint"
+            else:
+                source = "Claude via OpenRouter"
             print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
@@ -1282,6 +1475,10 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+        # Cache only the derived auxiliary compression context override that is
+        # needed later by the startup feasibility check.  Avoid exposing a
+        # broad pseudo-public config object on the agent instance.
+        self._aux_compression_context_length_config = None
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1411,6 +1608,24 @@ class AIAgent:
         compression_enabled = str(_compression_cfg.get("enabled", True)).lower() in ("true", "1", "yes")
         compression_target_ratio = float(_compression_cfg.get("target_ratio", 0.20))
         compression_protect_last = int(_compression_cfg.get("protect_last_n", 20))
+
+        # Read optional explicit context_length override for the auxiliary
+        # compression model. Custom endpoints often cannot report this via
+        # /models, so the startup feasibility check needs the config hint.
+        try:
+            _aux_cfg = _agent_cfg.get("auxiliary", {}).get("compression", {})
+        except Exception:
+            _aux_cfg = {}
+        if isinstance(_aux_cfg, dict):
+            _aux_context_config = _aux_cfg.get("context_length")
+        else:
+            _aux_context_config = None
+        if _aux_context_config is not None:
+            try:
+                _aux_context_config = int(_aux_context_config)
+            except (TypeError, ValueError):
+                _aux_context_config = None
+        self._aux_compression_context_length_config = _aux_context_config
 
         # Read explicit context_length override from model config
         _model_cfg = _agent_cfg.get("model", {})
@@ -1662,6 +1877,7 @@ class AIAgent:
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
+            "use_native_cache_layout": self._use_native_cache_layout,
             # Context engine state that _try_activate_fallback() overwrites.
             # Use getattr for model/base_url/api_key/provider since plugin
             # engines may not have these (they're ContextCompressor-specific).
@@ -1781,8 +1997,9 @@ class AIAgent:
             self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
             self._anthropic_client = build_anthropic_client(
                 effective_key, self._anthropic_base_url,
+                timeout=get_provider_request_timeout(self.provider, self.model),
             )
-            self._is_anthropic_oauth = _is_oauth_token(effective_key)
+            self._is_anthropic_oauth = _is_oauth_token(effective_key) if _is_native_anthropic else False
             self.client = None
             self._client_kwargs = {}
         else:
@@ -1794,6 +2011,9 @@ class AIAgent:
             }
             # 应用 provider 特定的 headers 和用户自定义的 extra_headers
             self._apply_client_headers_for_base_url(effective_base)
+            _sm_timeout = get_provider_request_timeout(self.provider, self.model)
+            if _sm_timeout is not None:
+                self._client_kwargs["timeout"] = _sm_timeout
             self.client = self._create_openai_client(
                 dict(self._client_kwargs),
                 reason="switch_model",
@@ -1801,10 +2021,13 @@ class AIAgent:
             )
 
         # ── Re-evaluate prompt caching ──
-        is_native_anthropic = api_mode == "anthropic_messages" and new_provider == "anthropic"
-        self._use_prompt_caching = (
-            ("openrouter" in (self.base_url or "").lower() and "claude" in new_model.lower())
-            or is_native_anthropic
+        self._use_prompt_caching, self._use_native_cache_layout = (
+            self._anthropic_prompt_cache_policy(
+                provider=new_provider,
+                base_url=self.base_url,
+                api_mode=api_mode,
+                model=new_model,
+            )
         )
 
         # ── Update context compressor ──
@@ -1839,6 +2062,7 @@ class AIAgent:
             "api_key": getattr(self, "api_key", ""),
             "client_kwargs": dict(self._client_kwargs),
             "use_prompt_caching": self._use_prompt_caching,
+            "use_native_cache_layout": self._use_native_cache_layout,
             "compressor_model": getattr(_cc, "model", self.model) if _cc else self.model,
             "compressor_base_url": getattr(_cc, "base_url", self.base_url) if _cc else self.base_url,
             "compressor_api_key": getattr(_cc, "api_key", "") if _cc else "",
@@ -1988,7 +2212,10 @@ class AIAgent:
             return
         try:
             from agent.auxiliary_client import get_text_auxiliary_client
-            from agent.model_metadata import get_model_context_length
+            from agent.model_metadata import (
+                MINIMUM_CONTEXT_LENGTH,
+                get_model_context_length,
+            )
 
             client, aux_model = get_text_auxiliary_client(
                 "compression",
@@ -2011,45 +2238,61 @@ class AIAgent:
             aux_base_url = str(getattr(client, "base_url", ""))
             aux_api_key = str(getattr(client, "api_key", ""))
 
-            # Read user-configured context_length for the compression model.
-            # Custom endpoints often don't support /models API queries so
-            # get_model_context_length() falls through to the 128K default,
-            # ignoring the explicit config value.  Pass it as the highest-
-            # priority hint so the configured value is always respected.
-            _aux_cfg = (self.config or {}).get("auxiliary", {}).get("compression", {})
-            _aux_context_config = _aux_cfg.get("context_length") if isinstance(_aux_cfg, dict) else None
-            if _aux_context_config is not None:
-                try:
-                    _aux_context_config = int(_aux_context_config)
-                except (TypeError, ValueError):
-                    _aux_context_config = None
-
             aux_context = get_model_context_length(
                 aux_model,
                 base_url=aux_base_url,
                 api_key=aux_api_key,
-                config_context_length=_aux_context_config,
+                config_context_length=getattr(self, "_aux_compression_context_length_config", None),
             )
+
+            # Hard floor: the auxiliary compression model must have at least
+            # MINIMUM_CONTEXT_LENGTH (64K) tokens of context.  The main model
+            # is already required to meet this floor (checked earlier in
+            # __init__), so the compression model must too — otherwise it
+            # cannot summarise a full threshold-sized window of main-model
+            # content.  Mirrors the main-model rejection pattern.
+            if aux_context and aux_context < MINIMUM_CONTEXT_LENGTH:
+                raise ValueError(
+                    f"Auxiliary compression model {aux_model} has a context "
+                    f"window of {aux_context:,} tokens, which is below the "
+                    f"minimum {MINIMUM_CONTEXT_LENGTH:,} required by Hermes "
+                    f"Agent.  Choose a compression model with at least "
+                    f"{MINIMUM_CONTEXT_LENGTH // 1000}K context (set "
+                    f"auxiliary.compression.model in config.yaml), or set "
+                    f"auxiliary.compression.context_length to override the "
+                    f"detected value if it is wrong."
+                )
 
             threshold = self.context_compressor.threshold_tokens
             if aux_context < threshold:
-                # Suggest a threshold that would fit the aux model,
-                # rounded down to a clean percentage.
-                safe_pct = int((aux_context / self.context_compressor.context_length) * 100)
+                # Auto-correct: lower the live session threshold so
+                # compression actually works this session.  The hard floor
+                # above guarantees aux_context >= MINIMUM_CONTEXT_LENGTH,
+                # so the new threshold is always >= 64K.
+                old_threshold = threshold
+                new_threshold = aux_context
+                self.context_compressor.threshold_tokens = new_threshold
+                # Keep threshold_percent in sync so future main-model
+                # context_length changes (update_model) re-derive from a
+                # sensible number rather than the original too-high value.
+                main_ctx = self.context_compressor.context_length
+                if main_ctx:
+                    self.context_compressor.threshold_percent = (
+                        new_threshold / main_ctx
+                    )
+                safe_pct = int((aux_context / main_ctx) * 100) if main_ctx else 50
                 msg = (
-                    f"⚠ Compression model ({aux_model}) context "
-                    f"is {aux_context:,} tokens, but the main model's "
-                    f"compression threshold is {threshold:,} tokens. "
-                    f"Context compression will not be possible — the "
-                    f"content to summarise will exceed the auxiliary "
-                    f"model's context window.\n"
-                    f"  Fix options (config.yaml):\n"
+                    f"⚠ Compression model ({aux_model}) context is "
+                    f"{aux_context:,} tokens, but the main model's "
+                    f"compression threshold was {old_threshold:,} tokens. "
+                    f"Auto-lowered this session's threshold to "
+                    f"{new_threshold:,} tokens so compression can run.\n"
+                    f"  To make this permanent, edit config.yaml — either:\n"
                     f"  1. Use a larger compression model:\n"
                     f"       auxiliary:\n"
                     f"         compression:\n"
-                    f"           model: <model-with-{threshold:,}+-context>\n"
-                    f"  2. Lower the compression threshold to fit "
-                    f"the current model:\n"
+                    f"           model: <model-with-{old_threshold:,}+-context>\n"
+                    f"  2. Lower the compression threshold:\n"
                     f"       compression:\n"
                     f"         threshold: 0.{safe_pct:02d}"
                 )
@@ -2058,12 +2301,17 @@ class AIAgent:
                 logger.warning(
                     "Auxiliary compression model %s has %d token context, "
                     "below the main model's compression threshold of %d "
-                    "tokens — compression summaries will fail or be "
-                    "severely truncated.",
+                    "tokens — auto-lowered session threshold to %d to "
+                    "keep compression working.",
                     aux_model,
                     aux_context,
-                    threshold,
+                    old_threshold,
+                    new_threshold,
                 )
+        except ValueError:
+            # Hard rejections (aux below minimum context) must propagate
+            # so the session refuses to start.
+            raise
         except Exception as exc:
             logger.debug(
                 "Compression feasibility check failed (non-fatal): %s", exc
@@ -2091,9 +2339,116 @@ class AIAgent:
         url = (base_url or self._base_url_lower).lower()
         return "api.openai.com" in url and "openrouter" not in url
 
+    def _resolved_api_call_timeout(self) -> float:
+        """Resolve the effective per-call request timeout in seconds.
+
+        Priority:
+          1. ``providers.<id>.models.<model>.timeout_seconds`` (per-model override)
+          2. ``providers.<id>.request_timeout_seconds`` (provider-wide)
+          3. ``HERMES_API_TIMEOUT`` env var (legacy escape hatch)
+          4. 1800.0s default
+
+        Used by OpenAI-wire chat completions (streaming and non-streaming) so
+        the per-provider config knob wins over the 1800s default.  Without this
+        helper, the hardcoded ``HERMES_API_TIMEOUT`` fallback would always be
+        passed as a per-call ``timeout=`` kwarg, overriding the client-level
+        timeout the AIAgent.__init__ path configured.
+        """
+        cfg = get_provider_request_timeout(self.provider, self.model)
+        if cfg is not None:
+            return cfg
+        return float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+
+    def _resolved_api_call_stale_timeout_base(self) -> tuple[float, bool]:
+        """Resolve the base non-stream stale timeout and whether it is implicit.
+
+        Priority:
+          1. ``providers.<id>.models.<model>.stale_timeout_seconds``
+          2. ``providers.<id>.stale_timeout_seconds``
+          3. ``HERMES_API_CALL_STALE_TIMEOUT`` env var
+          4. 300.0s default
+
+        Returns ``(timeout_seconds, uses_implicit_default)`` so the caller can
+        preserve legacy behaviors that only apply when the user has *not*
+        explicitly configured a stale timeout, such as auto-disabling the
+        detector for local endpoints.
+        """
+        cfg = get_provider_stale_timeout(self.provider, self.model)
+        if cfg is not None:
+            return cfg, False
+
+        env_timeout = os.getenv("HERMES_API_CALL_STALE_TIMEOUT")
+        if env_timeout is not None:
+            return float(env_timeout), False
+
+        return 300.0, True
+
+    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+        """Compute the effective non-stream stale timeout for this request."""
+        stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
+        base_url = getattr(self, "_base_url", None) or self.base_url or ""
+        if uses_implicit_default and base_url and is_local_endpoint(base_url):
+            return float("inf")
+
+        est_tokens = sum(len(str(v)) for v in messages) // 4
+        if est_tokens > 100_000:
+            return max(stale_base, 600.0)
+        if est_tokens > 50_000:
+            return max(stale_base, 450.0)
+        return stale_base
+
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
+
+    def _anthropic_prompt_cache_policy(
+        self,
+        *,
+        provider: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_mode: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> tuple[bool, bool]:
+        """Decide whether to apply Anthropic prompt caching and which layout to use.
+
+        Returns ``(should_cache, use_native_layout)``:
+          * ``should_cache`` — inject ``cache_control`` breakpoints for this
+            request (applies to OpenRouter Claude, native Anthropic, and
+            third-party gateways that speak the native Anthropic protocol).
+          * ``use_native_layout`` — place markers on the *inner* content
+            blocks (native Anthropic accepts and requires this layout);
+            when False markers go on the message envelope (OpenRouter and
+            OpenAI-wire proxies expect the looser layout).
+
+        Third-party providers using the native Anthropic transport
+        (``api_mode == 'anthropic_messages'`` + Claude-named model) get
+        caching with the native layout so they benefit from the same
+        cost reduction as direct Anthropic callers, provided their
+        gateway implements the Anthropic cache_control contract
+        (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
+        """
+        eff_provider = (provider if provider is not None else self.provider) or ""
+        eff_base_url = base_url if base_url is not None else (self.base_url or "")
+        eff_api_mode = api_mode if api_mode is not None else (self.api_mode or "")
+        eff_model = (model if model is not None else self.model) or ""
+
+        base_lower = eff_base_url.lower()
+        is_claude = "claude" in eff_model.lower()
+        is_openrouter = "openrouter" in base_lower
+        is_anthropic_wire = eff_api_mode == "anthropic_messages"
+        is_native_anthropic = (
+            is_anthropic_wire
+            and (eff_provider == "anthropic" or "api.anthropic.com" in base_lower)
+        )
+
+        if is_native_anthropic:
+            return True, True
+        if is_openrouter and is_claude:
+            return True, False
+        if is_anthropic_wire and is_claude:
+            # Third-party Anthropic-compatible gateway.
+            return True, True
+        return False, False
 
     @staticmethod
     def _model_requires_responses_api(model: str) -> bool:
@@ -4080,7 +4435,14 @@ class AIAgent:
 
             if role in {"user", "assistant"}:
                 content = msg.get("content", "")
-                content_text = str(content) if content is not None else ""
+                if isinstance(content, list):
+                    content_parts = _chat_content_to_responses_parts(content)
+                    content_text = "".join(
+                        p.get("text", "") for p in content_parts if p.get("type") == "input_text"
+                    )
+                else:
+                    content_parts = []
+                    content_text = str(content) if content is not None else ""
 
                 if role == "assistant":
                     # Replay encrypted reasoning items from previous turns
@@ -4103,7 +4465,9 @@ class AIAgent:
                                     seen_item_ids.add(item_id)
                                 has_codex_reasoning = True
 
-                    if content_text.strip():
+                    if content_parts:
+                        items.append({"role": "assistant", "content": content_parts})
+                    elif content_text.strip():
                         items.append({"role": "assistant", "content": content_text})
                     elif has_codex_reasoning:
                         # The Responses API requires a following item after each
@@ -4156,7 +4520,12 @@ class AIAgent:
                             })
                     continue
 
-                items.append({"role": role, "content": content_text})
+                # Non-assistant (user) role: emit multimodal parts when present,
+                # otherwise fall back to the text payload.
+                if content_parts:
+                    items.append({"role": role, "content": content_parts})
+                else:
+                    items.append({"role": role, "content": content_text})
                 continue
 
             if role == "tool":
@@ -4256,6 +4625,46 @@ class AIAgent:
                 content = item.get("content", "")
                 if content is None:
                     content = ""
+                if isinstance(content, list):
+                    # Multimodal content from ``_chat_messages_to_responses_input``
+                    # is already in Responses format (``input_text`` / ``input_image``).
+                    # Validate each part and pass through.
+                    validated: List[Dict[str, Any]] = []
+                    for part_idx, part in enumerate(content):
+                        if isinstance(part, str):
+                            if part:
+                                validated.append({"type": "input_text", "text": part})
+                            continue
+                        if not isinstance(part, dict):
+                            raise ValueError(
+                                f"Codex Responses input[{idx}].content[{part_idx}] must be an object or string."
+                            )
+                        ptype = str(part.get("type") or "").strip().lower()
+                        if ptype in {"input_text", "text", "output_text"}:
+                            text = part.get("text", "")
+                            if not isinstance(text, str):
+                                text = str(text or "")
+                            validated.append({"type": "input_text", "text": text})
+                        elif ptype in {"input_image", "image_url"}:
+                            image_ref = part.get("image_url", "")
+                            detail = part.get("detail")
+                            if isinstance(image_ref, dict):
+                                url = image_ref.get("url", "")
+                                detail = image_ref.get("detail", detail)
+                            else:
+                                url = image_ref
+                            if not isinstance(url, str):
+                                url = str(url or "")
+                            image_part: Dict[str, Any] = {"type": "input_image", "image_url": url}
+                            if isinstance(detail, str) and detail.strip():
+                                image_part["detail"] = detail.strip()
+                            validated.append(image_part)
+                        else:
+                            raise ValueError(
+                                f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
+                            )
+                    normalized.append({"role": role, "content": validated})
+                    continue
                 if not isinstance(content, str):
                     content = str(content)
 
@@ -4657,6 +5066,30 @@ class AIAgent:
             return bool(getattr(http_client, "is_closed", False))
         return False
 
+    @staticmethod
+    def _build_keepalive_http_client() -> Any:
+        try:
+            import httpx as _httpx
+            import socket as _socket
+
+            _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
+            if hasattr(_socket, "TCP_KEEPIDLE"):
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
+            elif hasattr(_socket, "TCP_KEEPALIVE"):
+                _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
+            # When a custom transport is provided, httpx won't auto-read proxy
+            # from env vars (allow_env_proxies = trust_env and transport is None).
+            # Explicitly read proxy settings to ensure HTTP_PROXY/HTTPS_PROXY work.
+            _proxy = _get_proxy_from_env()
+            return _httpx.Client(
+                transport=_httpx.HTTPTransport(socket_options=_sock_opts),
+                proxy=_proxy,
+            )
+        except Exception:
+            return None
+
     def _create_openai_client(self, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
         from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
         # Treat client_kwargs as read-only. Callers pass self._client_kwargs (or shallow
@@ -4697,6 +5130,27 @@ class AIAgent:
                 self._client_log_context(),
             )
             return client
+        if self.provider == "gemini":
+            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
+
+            base_url = str(client_kwargs.get("base_url", "") or "")
+            if is_native_gemini_base_url(base_url):
+                safe_kwargs = {
+                    k: v for k, v in client_kwargs.items()
+                    if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+                }
+                if "http_client" not in safe_kwargs:
+                    keepalive_http = self._build_keepalive_http_client()
+                    if keepalive_http is not None:
+                        safe_kwargs["http_client"] = keepalive_http
+                client = GeminiNativeClient(**safe_kwargs)
+                logger.info(
+                    "Gemini native client created (%s, shared=%s) %s",
+                    reason,
+                    shared,
+                    self._client_log_context(),
+                )
+                return client
         # Inject TCP keepalives so the kernel detects dead provider connections
         # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
         # this, a peer that drops mid-stream leaves the socket in a state where
@@ -4715,23 +5169,9 @@ class AIAgent:
         # Tests in ``tests/run_agent/test_create_openai_client_reuse.py`` and
         # ``tests/run_agent/test_sequential_chats_live.py`` pin this invariant.
         if "http_client" not in client_kwargs:
-            try:
-                import httpx as _httpx
-                import socket as _socket
-                _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
-                if hasattr(_socket, "TCP_KEEPIDLE"):
-                    # Linux
-                    _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 30))
-                    _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 10))
-                    _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3))
-                elif hasattr(_socket, "TCP_KEEPALIVE"):
-                    # macOS (uses TCP_KEEPALIVE instead of TCP_KEEPIDLE)
-                    _sock_opts.append((_socket.IPPROTO_TCP, _socket.TCP_KEEPALIVE, 30))
-                client_kwargs["http_client"] = _httpx.Client(
-                    transport=_httpx.HTTPTransport(socket_options=_sock_opts),
-                )
-            except Exception:
-                pass  # Fall through to default transport if socket opts fail
+            keepalive_http = self._build_keepalive_http_client()
+            if keepalive_http is not None:
+                client_kwargs["http_client"] = keepalive_http
         client = OpenAI(**client_kwargs)
         logger.info(
             "OpenAI client created (%s, shared=%s) %s",
@@ -5233,15 +5673,22 @@ class AIAgent:
             pass
 
         try:
-            self._anthropic_client = build_anthropic_client(new_token, getattr(self, "_anthropic_base_url", None))
+            self._anthropic_client = build_anthropic_client(
+                new_token,
+                getattr(self, "_anthropic_base_url", None),
+                timeout=get_provider_request_timeout(self.provider, self.model),
+            )
         except Exception as exc:
             logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
             return False
 
         self._anthropic_api_key = new_token
-        # Update OAuth flag — token type may have changed (API key ↔ OAuth)
+        # Update OAuth flag — token type may have changed (API key ↔ OAuth).
+        # Only treat as OAuth on native Anthropic; third-party endpoints using
+        # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
+        # identity-injection guard).
         from agent.anthropic_adapter import _is_oauth_token
-        self._is_anthropic_oauth = _is_oauth_token(new_token)
+        self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
@@ -5258,6 +5705,11 @@ class AIAgent:
             self._client_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
         elif "portal.qwen.ai" in normalized:
             self._client_kwargs["default_headers"] = _qwen_portal_headers()
+        elif "chatgpt.com" in normalized:
+            from agent.auxiliary_client import _codex_cloudflare_headers
+            self._client_kwargs["default_headers"] = _codex_cloudflare_headers(
+                self._client_kwargs.get("api_key", "")
+            )
         else:
             self._client_kwargs.pop("default_headers", None)
 
@@ -5282,8 +5734,11 @@ class AIAgent:
 
             self._anthropic_api_key = runtime_key
             self._anthropic_base_url = runtime_base
-            self._anthropic_client = build_anthropic_client(runtime_key, runtime_base)
-            self._is_anthropic_oauth = _is_oauth_token(runtime_key)
+            self._anthropic_client = build_anthropic_client(
+                runtime_key, runtime_base,
+                timeout=get_provider_request_timeout(self.provider, self.model),
+            )
+            self._is_anthropic_oauth = _is_oauth_token(runtime_key) if self.provider == "anthropic" else False
             self.api_key = runtime_key
             self.base_url = runtime_base
             return
@@ -5439,18 +5894,9 @@ class AIAgent:
         # httpx timeout (default 1800s) with zero feedback.  The stale
         # detector kills the connection early so the main retry loop can
         # apply richer recovery (credential rotation, provider fallback).
-        _stale_base = float(os.getenv("HERMES_API_CALL_STALE_TIMEOUT", 300.0))
-        _base_url = getattr(self, "_base_url", None) or ""
-        if _stale_base == 300.0 and _base_url and is_local_endpoint(_base_url):
-            _stale_timeout = float("inf")
-        else:
-            _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
-            if _est_tokens > 100_000:
-                _stale_timeout = max(_stale_base, 600.0)
-            elif _est_tokens > 50_000:
-                _stale_timeout = max(_stale_base, 450.0)
-            else:
-                _stale_timeout = _stale_base
+        _stale_timeout = self._compute_non_stream_stale_timeout(
+            api_kwargs.get("messages", [])
+        )
 
         _call_start = time.time()
         self._touch_activity("waiting for non-streaming API response")
@@ -5494,6 +5940,7 @@ class AIAgent:
                         self._anthropic_client = build_anthropic_client(
                             self._anthropic_api_key,
                             getattr(self, "_anthropic_base_url", None),
+                            timeout=get_provider_request_timeout(self.provider, self.model),
                         )
                     else:
                         rc = request_client_holder.get("client")
@@ -5525,6 +5972,7 @@ class AIAgent:
                         self._anthropic_client = build_anthropic_client(
                             self._anthropic_api_key,
                             getattr(self, "_anthropic_base_url", None),
+                            timeout=get_provider_request_timeout(self.provider, self.model),
                         )
                     else:
                         request_client = request_client_holder.get("client")
@@ -5741,18 +6189,30 @@ class AIAgent:
         def _call_chat_completions():
             """Stream a chat completions response."""
             import httpx as _httpx
-            _base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
-            _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
-            # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
-            # prefill on large contexts before producing the first token.
-            # Auto-increase the httpx read timeout unless the user explicitly
-            # overrode HERMES_STREAM_READ_TIMEOUT.
-            if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
-                _stream_read_timeout = _base_timeout
-                logger.debug(
-                    "Local provider detected (%s) — stream read timeout raised to %.0fs",
-                    self.base_url, _stream_read_timeout,
-                )
+            # Per-provider / per-model request_timeout_seconds (from config.yaml)
+            # wins over the HERMES_API_TIMEOUT env default if the user set it.
+            _provider_timeout_cfg = get_provider_request_timeout(self.provider, self.model)
+            _base_timeout = (
+                _provider_timeout_cfg
+                if _provider_timeout_cfg is not None
+                else float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+            )
+            # Read timeout: config wins here too.  Otherwise use
+            # HERMES_STREAM_READ_TIMEOUT (default 120s) for cloud providers.
+            if _provider_timeout_cfg is not None:
+                _stream_read_timeout = _provider_timeout_cfg
+            else:
+                _stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 120.0))
+                # Local providers (Ollama, llama.cpp, vLLM) can take minutes for
+                # prefill on large contexts before producing the first token.
+                # Auto-increase the httpx read timeout unless the user explicitly
+                # overrode HERMES_STREAM_READ_TIMEOUT.
+                if _stream_read_timeout == 120.0 and self.base_url and is_local_endpoint(self.base_url):
+                    _stream_read_timeout = _base_timeout
+                    logger.debug(
+                        "Local provider detected (%s) — stream read timeout raised to %.0fs",
+                        self.base_url, _stream_read_timeout,
+                    )
             stream_kwargs = {
                 **api_kwargs,
                 "stream": True,
@@ -6253,6 +6713,7 @@ class AIAgent:
                         self._anthropic_client = build_anthropic_client(
                             self._anthropic_api_key,
                             getattr(self, "_anthropic_base_url", None),
+                            timeout=get_provider_request_timeout(self.provider, self.model),
                         )
                     else:
                         request_client = request_client_holder.get("client")
@@ -6409,6 +6870,11 @@ class AIAgent:
             self.api_mode = fb_api_mode
             self._fallback_activated = True
 
+            # Honor per-provider / per-model request_timeout_seconds for the
+            # fallback target (same knob the primary client uses).  None = use
+            # SDK default.
+            _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
+
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
                 from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
@@ -6416,8 +6882,10 @@ class AIAgent:
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
                 self._anthropic_base_url = fb_base_url
-                self._anthropic_client = build_anthropic_client(effective_key, self._anthropic_base_url)
-                self._is_anthropic_oauth = _is_oauth_token(effective_key)
+                self._anthropic_client = build_anthropic_client(
+                    effective_key, self._anthropic_base_url, timeout=_fb_timeout,
+                )
+                self._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
                 self.client = None
                 self._client_kwargs = {}
             else:
@@ -6440,12 +6908,21 @@ class AIAgent:
                     "base_url": fb_base_url,
                     **({"default_headers": dict(fb_headers)} if fb_headers else {}),
                 }
+                if _fb_timeout is not None:
+                    self._client_kwargs["timeout"] = _fb_timeout
+                    # Rebuild the shared OpenAI client so the configured
+                    # timeout takes effect on the very next fallback request,
+                    # not only after a later credential-rotation rebuild.
+                    self._replace_primary_openai_client(reason="fallback_timeout_apply")
 
             # Re-evaluate prompt caching for the new provider/model
-            is_native_anthropic = fb_api_mode == "anthropic_messages" and fb_provider == "anthropic"
-            self._use_prompt_caching = (
-                ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
-                or is_native_anthropic
+            self._use_prompt_caching, self._use_native_cache_layout = (
+                self._anthropic_prompt_cache_policy(
+                    provider=fb_provider,
+                    base_url=fb_base_url,
+                    api_mode=fb_api_mode,
+                    model=fb_model,
+                )
             )
 
             # Update context compressor limits for the fallback model.
@@ -6505,6 +6982,12 @@ class AIAgent:
             self.api_key = rt["api_key"]
             self._client_kwargs = dict(rt["client_kwargs"])
             self._use_prompt_caching = rt["use_prompt_caching"]
+            # Default to native layout when the restored snapshot predates the
+            # native-vs-proxy split (older sessions saved before this PR).
+            self._use_native_cache_layout = rt.get(
+                "use_native_cache_layout",
+                self.api_mode == "anthropic_messages" and self.provider == "anthropic",
+            )
 
             # ── Rebuild client for the primary provider ──
             if self.api_mode == "anthropic_messages":
@@ -6513,6 +6996,7 @@ class AIAgent:
                 self._anthropic_base_url = rt["anthropic_base_url"]
                 self._anthropic_client = build_anthropic_client(
                     rt["anthropic_api_key"], rt["anthropic_base_url"],
+                    timeout=get_provider_request_timeout(self.provider, self.model),
                 )
                 self._is_anthropic_oauth = rt["is_anthropic_oauth"]
                 self.client = None
@@ -6609,6 +7093,7 @@ class AIAgent:
                 self._anthropic_base_url = rt["anthropic_base_url"]
                 self._anthropic_client = build_anthropic_client(
                     rt["anthropic_api_key"], rt["anthropic_base_url"],
+                    timeout=get_provider_request_timeout(self.provider, self.model),
                 )
                 self._is_anthropic_oauth = rt["is_anthropic_oauth"]
                 self.client = None
@@ -6780,11 +7265,31 @@ class AIAgent:
         Alibaba/DashScope keeps dots (e.g. qwen3.5-plus).
         MiniMax keeps dots (e.g. MiniMax-M2.7).
         OpenCode Go/Zen keeps dots for non-Claude models (e.g. minimax-m2.5-free).
-        ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1)."""
-        if (getattr(self, "provider", "") or "").lower() in {"alibaba", "minimax", "minimax-cn", "opencode-go", "opencode-zen", "zai"}:
+        ZAI/Zhipu keeps dots (e.g. glm-4.7, glm-5.1).
+        AWS Bedrock uses dotted inference-profile IDs
+        (e.g. ``global.anthropic.claude-opus-4-7``,
+        ``us.anthropic.claude-sonnet-4-5-20250929-v1:0``) and rejects
+        the hyphenated form with
+        ``HTTP 400 The provided model identifier is invalid``.
+        Regression for #11976; mirrors the opencode-go fix for #5211
+        (commit f77be22c), which extended this same allowlist."""
+        if (getattr(self, "provider", "") or "").lower() in {
+            "alibaba", "minimax", "minimax-cn",
+            "opencode-go", "opencode-zen",
+            "zai", "bedrock",
+        }:
             return True
         base = (getattr(self, "base_url", "") or "").lower()
-        return "dashscope" in base or "aliyuncs" in base or "minimax" in base or "opencode.ai/zen/" in base or "bigmodel.cn" in base
+        return (
+            "dashscope" in base
+            or "aliyuncs" in base
+            or "minimax" in base
+            or "opencode.ai/zen/" in base
+            or "bigmodel.cn" in base
+            # AWS Bedrock runtime endpoints — defense-in-depth when
+            # ``provider`` is unset but ``base_url`` still names Bedrock.
+            or "bedrock-runtime." in base
+        )
 
     def _is_qwen_portal(self) -> bool:
         """Return True when the base URL targets Qwen Portal."""
@@ -7052,14 +7557,14 @@ class AIAgent:
         api_kwargs = {
             "model": self.model,
             "messages": sanitized_messages,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 1800.0)),
+            "timeout": self._resolved_api_call_timeout(),
         }
         try:
             from agent.auxiliary_client import _fixed_temperature_for_model
         except Exception:
             _fixed_temperature_for_model = None
         if _fixed_temperature_for_model is not None:
-            fixed_temperature = _fixed_temperature_for_model(self.model)
+            fixed_temperature = _fixed_temperature_for_model(self.model, self.base_url)
             if fixed_temperature is not None:
                 api_kwargs["temperature"] = fixed_temperature
         if self._is_qwen_portal():
@@ -7505,7 +8010,7 @@ class AIAgent:
             _aux_available = True
             # Use the fixed-temperature override (e.g. kimi-for-coding → 0.6) if
             # the model has a strict contract; otherwise the historical 0.3 default.
-            _flush_temperature = _fixed_temperature_for_model(self.model)
+            _flush_temperature = _fixed_temperature_for_model(self.model, self.base_url)
             if _flush_temperature is None:
                 _flush_temperature = 0.3
             try:
@@ -8121,6 +8626,11 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            # ── Per-tool /steer drain ───────────────────────────────────
+            # Same as the sequential path: drain between each collected
+            # result so the steer lands as early as possible.
+            self._apply_pending_steer_to_tool_results(messages, 1)
+
         # ── Per-turn aggregate budget enforcement ─────────────────────────
         num_tools = len(parsed_calls)
         if num_tools > 0:
@@ -8484,6 +8994,12 @@ class AIAgent:
             }
             messages.append(tool_msg)
 
+            # ── Per-tool /steer drain ───────────────────────────────────
+            # Drain pending steer BETWEEN individual tool calls so the
+            # injection lands as soon as a tool finishes — not after the
+            # entire batch.  The model sees it on the next API iteration.
+            self._apply_pending_steer_to_tool_results(messages, 1)
+
             if not self.quiet_mode:
                 if self.verbose_logging:
                     print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
@@ -8561,7 +9077,7 @@ class AIAgent:
             except Exception:
                 _fixed_temperature_for_model = None
             _summary_temperature = (
-                _fixed_temperature_for_model(self.model)
+                _fixed_temperature_for_model(self.model, self.base_url)
                 if _fixed_temperature_for_model is not None
                 else None
             )
@@ -8791,7 +9307,8 @@ class AIAgent:
         self.iteration_budget = IterationBudget(self.max_iterations)
 
         # Log conversation turn start for debugging/observability
-        _msg_preview = (user_message[:80] + "...") if len(user_message) > 80 else user_message
+        _preview_text = _summarize_user_message_for_log(user_message)
+        _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
         _msg_preview = _msg_preview.replace("\n", " ")
         logger.info(
             "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
@@ -8839,7 +9356,8 @@ class AIAgent:
         self._persist_user_message_idx = current_turn_user_idx
         
         if not self.quiet_mode:
-            self._safe_print(f"💬 Starting conversation: '{user_message[:60]}{'...' if len(user_message) > 60 else ''}'")
+            _print_preview = _summarize_user_message_for_log(user_message)
+            self._safe_print(f"💬 Starting conversation: '{_print_preview[:60]}{'...' if len(_print_preview) > 60 else ''}'")
         
         # ── System prompt (cached per session for prefix caching) ──
         # Built once on first call, reused for all subsequent calls.
@@ -9183,12 +9701,19 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
-            # Apply Anthropic prompt caching for Claude models via OpenRouter.
-            # Auto-detected: if model name contains "claude" and base_url is OpenRouter,
-            # inject cache_control breakpoints (system + last 3 messages) to reduce
-            # input token costs by ~75% on multi-turn conversations.
+            # Apply Anthropic prompt caching for Claude models on native
+            # Anthropic, OpenRouter, and third-party Anthropic-compatible
+            # gateways. Auto-detected: if ``_use_prompt_caching`` is set,
+            # inject cache_control breakpoints (system + last 3 messages)
+            # to reduce input token costs by ~75% on multi-turn
+            # conversations. Layout is chosen per endpoint by
+            # ``_anthropic_prompt_cache_policy``.
             if self._use_prompt_caching:
-                api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
+                api_messages = apply_anthropic_cache_control(
+                    api_messages,
+                    cache_ttl=self._cache_ttl,
+                    native_anthropic=self._use_native_cache_layout,
+                )
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
@@ -9222,7 +9747,10 @@ class AIAgent:
                                 ),
                             }}
                         except Exception:
-                            pass
+                            tc["function"]["arguments"] = _repair_tool_call_arguments(
+                                tc["function"]["arguments"],
+                                tc["function"].get("name", "?"),
+                            )
                     new_tcs.append(tc)
                 am["tool_calls"] = new_tcs
 
@@ -9645,25 +10173,30 @@ class AIAgent:
                     if finish_reason == "length":
                         self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
 
+                        # Normalize the truncated response to a single OpenAI-style
+                        # message shape so text-continuation and tool-call retry
+                        # work uniformly across chat_completions, bedrock_converse,
+                        # and anthropic_messages.  For Anthropic we use the same
+                        # adapter the agent loop already relies on so the rebuilt
+                        # interim assistant message is byte-identical to what
+                        # would have been appended in the non-truncated path.
+                        _trunc_msg = None
+                        if self.api_mode in ("chat_completions", "bedrock_converse"):
+                            _trunc_msg = response.choices[0].message if (hasattr(response, "choices") and response.choices) else None
+                        elif self.api_mode == "anthropic_messages":
+                            from agent.anthropic_adapter import normalize_anthropic_response
+                            _trunc_msg, _ = normalize_anthropic_response(
+                                response, strip_tool_prefix=self._is_anthropic_oauth
+                            )
+
+                        _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
+                        _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
+
                         # ── Detect thinking-budget exhaustion ──────────────
                         # When the model spends ALL output tokens on reasoning
                         # and has none left for the response, continuation
                         # retries are pointless.  Detect this early and give a
                         # targeted error instead of wasting 3 API calls.
-                        _trunc_content = None
-                        _trunc_has_tool_calls = False
-                        if self.api_mode in ("chat_completions", "bedrock_converse"):
-                            _trunc_msg = response.choices[0].message if (hasattr(response, "choices") and response.choices) else None
-                            _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
-                            _trunc_has_tool_calls = bool(getattr(_trunc_msg, "tool_calls", None)) if _trunc_msg else False
-                        elif self.api_mode == "anthropic_messages":
-                            # Anthropic response.content is a list of blocks
-                            _text_parts = []
-                            for _blk in getattr(response, "content", []):
-                                if getattr(_blk, "type", None) == "text":
-                                    _text_parts.append(getattr(_blk, "text", ""))
-                            _trunc_content = "\n".join(_text_parts) if _text_parts else None
-
                         # A response is "thinking exhausted" only when the model
                         # actually produced reasoning blocks but no visible text after
                         # them.  Models that do not use <think> tags (e.g. GLM-4.7 on
@@ -9720,9 +10253,9 @@ class AIAgent:
                                 "error": _exhaust_error,
                             }
 
-                        if self.api_mode in ("chat_completions", "bedrock_converse"):
-                            assistant_message = response.choices[0].message
-                            if not assistant_message.tool_calls:
+                        if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages"):
+                            assistant_message = _trunc_msg
+                            if assistant_message is not None and not _trunc_has_tool_calls:
                                 length_continue_retries += 1
                                 interim_msg = self._build_assistant_message(assistant_message, finish_reason)
                                 messages.append(interim_msg)
@@ -9760,9 +10293,9 @@ class AIAgent:
                                     "error": "Response remained truncated after 3 continuation attempts",
                                 }
 
-                        if self.api_mode in ("chat_completions", "bedrock_converse"):
-                            assistant_message = response.choices[0].message
-                            if assistant_message.tool_calls:
+                        if self.api_mode in ("chat_completions", "bedrock_converse", "anthropic_messages"):
+                            assistant_message = _trunc_msg
+                            if assistant_message is not None and _trunc_has_tool_calls:
                                 if truncated_tool_call_retries < 1:
                                     truncated_tool_call_retries += 1
                                     self._vprint(
@@ -11291,10 +11824,12 @@ class AIAgent:
                     # should_compress(0) never fires.  (#2153)
                     _compressor = self.context_compressor
                     if _compressor.last_prompt_tokens > 0:
-                        _real_tokens = (
-                            _compressor.last_prompt_tokens
-                            + _compressor.last_completion_tokens
-                        )
+                        # Only use prompt_tokens — completion/reasoning
+                        # tokens don't consume context window space.
+                        # Thinking models (GLM-5.1, QwQ, DeepSeek R1)
+                        # inflate completion_tokens with reasoning,
+                        # causing premature compression.  (#12026)
+                        _real_tokens = _compressor.last_prompt_tokens
                     else:
                         _real_tokens = estimate_messages_tokens_rough(messages)
 
@@ -11693,8 +12228,9 @@ class AIAgent:
         # Determine if conversation completed successfully
         completed = final_response is not None and api_call_count < self.max_iterations
 
-        # Save trajectory if enabled
-        self._save_trajectory(messages, user_message, completed)
+        # Save trajectory if enabled.  ``user_message`` may be a multimodal
+        # list of parts; the trajectory format wants a plain string.
+        self._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
 
         # Clean up VM and browser for this task after conversation completes
         self._cleanup_task_resources(effective_task_id)

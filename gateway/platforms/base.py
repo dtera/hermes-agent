@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import inspect
 import ipaddress
 import logging
 import os
@@ -552,6 +553,39 @@ async def cache_audio_from_url(url: str, ext: str = ".ogg", retries: int = 2) ->
 
 
 # ---------------------------------------------------------------------------
+# Video cache utilities
+#
+# Same pattern as image/audio cache -- videos from platforms are downloaded
+# here so the agent can reference them by local file path.
+# ---------------------------------------------------------------------------
+
+VIDEO_CACHE_DIR = get_hermes_dir("cache/videos", "video_cache")
+
+SUPPORTED_VIDEO_TYPES = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".avi": "video/x-msvideo",
+}
+
+
+def get_video_cache_dir() -> Path:
+    """Return the video cache directory, creating it if it doesn't exist."""
+    VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    return VIDEO_CACHE_DIR
+
+
+def cache_video_from_bytes(data: bytes, ext: str = ".mp4") -> str:
+    """Save raw video bytes to the cache and return the absolute file path."""
+    cache_dir = get_video_cache_dir()
+    filename = f"video_{uuid.uuid4().hex[:12]}{ext}"
+    filepath = cache_dir / filename
+    filepath.write_bytes(data)
+    return str(filepath)
+
+
+# ---------------------------------------------------------------------------
 # Document cache utilities
 #
 # Same pattern as image/audio cache -- documents from platforms are downloaded
@@ -880,10 +914,11 @@ class BasePlatformAdapter(ABC):
         # working on a task after --replace or manual restarts.
         self._background_tasks: set[asyncio.Task] = set()
         # One-shot callbacks to fire after the main response is delivered.
-        # Keyed by session_key.  GatewayRunner uses this to defer
-        # background-review notifications ("💾 Skill created") until the
-        # primary reply has been sent.
-        self._post_delivery_callbacks: Dict[str, Callable] = {}
+        # Keyed by session_key. Values are either a bare callback (legacy) or
+        # a ``(generation, callback)`` tuple so GatewayRunner can make deferred
+        # deliveries generation-aware and avoid stale runs clearing callbacks
+        # registered by a fresher run for the same session.
+        self._post_delivery_callbacks: Dict[str, Any] = {}
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Chats where auto-TTS on voice input is disabled (set by /voice off)
@@ -1401,7 +1436,13 @@ class BasePlatformAdapter(ABC):
 
         return paths, cleaned
 
-    async def _keep_typing(self, chat_id: str, interval: float = 2.0, metadata=None) -> None:
+    async def _keep_typing(
+        self,
+        chat_id: str,
+        interval: float = 2.0,
+        metadata=None,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
         """
         Continuously send typing indicator until cancelled.
         
@@ -1415,9 +1456,18 @@ class BasePlatformAdapter(ABC):
         """
         try:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    return
                 if chat_id not in self._typing_paused:
                     await self.send_typing(chat_id, metadata=metadata)
-                await asyncio.sleep(interval)
+                if stop_event is None:
+                    await asyncio.sleep(interval)
+                    continue
+                try:
+                    await asyncio.wait_for(stop_event.wait(), timeout=interval)
+                except asyncio.TimeoutError:
+                    continue
+                return
         except asyncio.CancelledError:
             pass  # Normal cancellation when handler completes
         finally:
@@ -1443,6 +1493,59 @@ class BasePlatformAdapter(ABC):
     def resume_typing_for_chat(self, chat_id: str) -> None:
         """Resume typing indicator for a chat after approval resolves."""
         self._typing_paused.discard(chat_id)
+
+    async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
+        """Signal the active session loop to stop and clear typing immediately."""
+        if session_key:
+            interrupt_event = self._active_sessions.get(session_key)
+            if interrupt_event is not None:
+                interrupt_event.set()
+        try:
+            await self.stop_typing(chat_id)
+        except Exception:
+            pass
+
+    def register_post_delivery_callback(
+        self,
+        session_key: str,
+        callback: Callable,
+        *,
+        generation: int | None = None,
+    ) -> None:
+        """Register a deferred callback to fire after the main response.
+
+        ``generation`` lets callers tie the callback to a specific gateway run
+        generation so stale runs cannot clear callbacks owned by a fresher run.
+        """
+        if not session_key or not callable(callback):
+            return
+        if generation is None:
+            self._post_delivery_callbacks[session_key] = callback
+        else:
+            self._post_delivery_callbacks[session_key] = (int(generation), callback)
+
+    def pop_post_delivery_callback(
+        self,
+        session_key: str,
+        *,
+        generation: int | None = None,
+    ) -> Callable | None:
+        """Pop a deferred callback, optionally requiring generation ownership."""
+        if not session_key:
+            return None
+        entry = self._post_delivery_callbacks.get(session_key)
+        if entry is None:
+            return None
+        if isinstance(entry, tuple) and len(entry) == 2:
+            entry_generation, callback = entry
+            if generation is not None and int(entry_generation) != int(generation):
+                return None
+            self._post_delivery_callbacks.pop(session_key, None)
+            return callback if callable(callback) else None
+        if generation is not None:
+            return None
+        self._post_delivery_callbacks.pop(session_key, None)
+        return entry if callable(entry) else None
 
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events
@@ -1714,10 +1817,23 @@ class BasePlatformAdapter(ABC):
         # Fall back to a new Event only if the entry was removed externally.
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        callback_generation = getattr(interrupt_event, "_hermes_run_generation", None)
         
         # Start continuous typing indicator (refreshes every 2 seconds)
         _thread_metadata = {"thread_id": event.source.thread_id} if event.source.thread_id else None
-        typing_task = asyncio.create_task(self._keep_typing(event.source.chat_id, metadata=_thread_metadata))
+        _keep_typing_kwargs = {"metadata": _thread_metadata}
+        try:
+            _keep_typing_sig = inspect.signature(self._keep_typing)
+        except (TypeError, ValueError):
+            _keep_typing_sig = None
+        if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
+            _keep_typing_kwargs["stop_event"] = interrupt_event
+        typing_task = asyncio.create_task(
+            self._keep_typing(
+                event.source.chat_id,
+                **_keep_typing_kwargs,
+            )
+        )
         
         try:
             await self._run_processing_hook("on_processing_start", event)
@@ -1976,7 +2092,14 @@ class BasePlatformAdapter(ABC):
         finally:
             # Fire any one-shot post-delivery callback registered for this
             # session (e.g. deferred background-review notifications).
-            _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
+            _callback_generation = callback_generation
+            if hasattr(self, "pop_post_delivery_callback"):
+                _post_cb = self.pop_post_delivery_callback(
+                    session_key,
+                    generation=_callback_generation,
+                )
+            else:
+                _post_cb = getattr(self, "_post_delivery_callbacks", {}).pop(session_key, None)
             if callable(_post_cb):
                 try:
                     _post_cb()
@@ -2022,10 +2145,10 @@ class BasePlatformAdapter(ABC):
                     pass
                 # Leave _active_sessions[session_key] populated — the drain
                 # task's own lifecycle will clean it up.
-                return
-            # Clean up session tracking
-            if session_key in self._active_sessions:
-                del self._active_sessions[session_key]
+            else:
+                # Clean up session tracking
+                if session_key in self._active_sessions:
+                    del self._active_sessions[session_key]
     
     async def cancel_background_tasks(self) -> None:
         """Cancel any in-flight background message-processing tasks.

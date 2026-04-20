@@ -1024,7 +1024,7 @@ class TestRunJobSkillBacked:
             "id": "multi-skill-job",
             "name": "multi skill test",
             "prompt": "Combine the results.",
-            "skills": ["blogwatcher", "find-nearby"],
+            "skills": ["blogwatcher", "maps"],
         }
 
         fake_db = MagicMock()
@@ -1057,12 +1057,12 @@ class TestRunJobSkillBacked:
         assert error is None
         assert final_response == "ok"
         assert skill_view_mock.call_count == 2
-        assert [call.args[0] for call in skill_view_mock.call_args_list] == ["blogwatcher", "find-nearby"]
+        assert [call.args[0] for call in skill_view_mock.call_args_list] == ["blogwatcher", "maps"]
 
         prompt_arg = mock_agent.run_conversation.call_args.args[0]
-        assert prompt_arg.index("blogwatcher") < prompt_arg.index("find-nearby")
+        assert prompt_arg.index("blogwatcher") < prompt_arg.index("maps")
         assert "Instructions for blogwatcher." in prompt_arg
-        assert "Instructions for find-nearby." in prompt_arg
+        assert "Instructions for maps." in prompt_arg
         assert "Combine the results." in prompt_arg
 
 
@@ -1238,6 +1238,30 @@ class TestParseWakeGate:
 
 class TestRunJobWakeGate:
     """Integration tests for run_job wake-gate short-circuit."""
+
+    @pytest.fixture(autouse=True)
+    def _stub_runtime_provider(self):
+        """Stub ``resolve_runtime_provider`` for wake-gate tests.
+
+        ``run_job`` resolves the runtime provider BEFORE constructing
+        ``AIAgent``, so these tests must mock ``resolve_runtime_provider``
+        in addition to ``AIAgent`` — otherwise in a hermetic CI env (no
+        API keys), the resolver raises and the test fails before the
+        patched AIAgent is ever reached.
+        """
+        fake_runtime = {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+            "source": "stub",
+            "requested_provider": None,
+        }
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            return_value=fake_runtime,
+        ):
+            yield
 
     def _make_job(self, name="wake-gate-test", script="check.py"):
         """Minimal valid cron job dict for run_job."""
