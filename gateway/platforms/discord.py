@@ -541,7 +541,6 @@ class DiscordAdapter(BasePlatformAdapter):
             # ctypes.util.find_library fails on macOS with Homebrew-installed libs,
             # so fall back to known Homebrew paths if needed.
             if not opus_path:
-                import sys
                 _homebrew_paths = (
                     "/opt/homebrew/lib/libopus.dylib",  # Apple Silicon
                     "/usr/local/lib/libopus.dylib",     # Intel Mac
@@ -1422,8 +1421,7 @@ class DiscordAdapter(BasePlatformAdapter):
         speaking_user_ids: set = set()
         receiver = self._voice_receivers.get(guild_id)
         if receiver:
-            import time as _time
-            now = _time.monotonic()
+            now = time.monotonic()
             with receiver._lock:
                 for ssrc, last_t in receiver._last_packet_time.items():
                     # Consider "speaking" if audio received within last 2 seconds
@@ -2131,10 +2129,42 @@ class DiscordAdapter(BasePlatformAdapter):
         # This ensures new commands added to COMMAND_REGISTRY in
         # hermes_cli/commands.py automatically appear as Discord slash
         # commands without needing a manual entry here.
+        def _build_auto_slash_command(_name: str, _description: str, _args_hint: str = ""):
+            """Build a discord.app_commands.Command that proxies to _run_simple_slash."""
+            discord_name = _name.lower()[:32]
+            desc = (_description or f"Run /{_name}")[:100]
+            has_args = bool(_args_hint)
+
+            if has_args:
+                def _make_args_handler(__name: str, __hint: str):
+                    @discord.app_commands.describe(args=f"Arguments: {__hint}"[:100])
+                    async def _handler(interaction: discord.Interaction, args: str = ""):
+                        await self._run_simple_slash(
+                            interaction, f"/{__name} {args}".strip()
+                        )
+                    _handler.__name__ = f"auto_slash_{__name.replace('-', '_')}"
+                    return _handler
+
+                handler = _make_args_handler(_name, _args_hint)
+            else:
+                def _make_simple_handler(__name: str):
+                    async def _handler(interaction: discord.Interaction):
+                        await self._run_simple_slash(interaction, f"/{__name}")
+                    _handler.__name__ = f"auto_slash_{__name.replace('-', '_')}"
+                    return _handler
+
+                handler = _make_simple_handler(_name)
+
+            return discord.app_commands.Command(
+                name=discord_name,
+                description=desc,
+                callback=handler,
+            )
+
+        already_registered: set[str] = set()
         try:
             from hermes_cli.commands import COMMAND_REGISTRY, _is_gateway_available, _resolve_config_gates
 
-            already_registered = set()
             try:
                 already_registered = {cmd.name for cmd in tree.get_commands()}
             except Exception:
@@ -2149,38 +2179,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 discord_name = cmd_def.name.lower()[:32]
                 if discord_name in already_registered:
                     continue
-                # Skip aliases that overlap with already-registered names
-                # (aliases for explicitly registered commands are handled above).
-                desc = (cmd_def.description or f"Run /{cmd_def.name}")[:100]
-                has_args = bool(cmd_def.args_hint)
-
-                if has_args:
-                    # Command takes optional arguments — create handler with
-                    # an optional ``args`` string parameter.
-                    def _make_args_handler(_name: str, _hint: str):
-                        @discord.app_commands.describe(args=f"Arguments: {_hint}"[:100])
-                        async def _handler(interaction: discord.Interaction, args: str = ""):
-                            await self._run_simple_slash(
-                                interaction, f"/{_name} {args}".strip()
-                            )
-                        _handler.__name__ = f"auto_slash_{_name.replace('-', '_')}"
-                        return _handler
-
-                    handler = _make_args_handler(cmd_def.name, cmd_def.args_hint)
-                else:
-                    # Parameterless command.
-                    def _make_simple_handler(_name: str):
-                        async def _handler(interaction: discord.Interaction):
-                            await self._run_simple_slash(interaction, f"/{_name}")
-                        _handler.__name__ = f"auto_slash_{_name.replace('-', '_')}"
-                        return _handler
-
-                    handler = _make_simple_handler(cmd_def.name)
-
-                auto_cmd = discord.app_commands.Command(
-                    name=discord_name,
-                    description=desc,
-                    callback=handler,
+                auto_cmd = _build_auto_slash_command(
+                    cmd_def.name,
+                    cmd_def.description,
+                    cmd_def.args_hint,
                 )
                 try:
                     tree.add_command(auto_cmd)
@@ -2196,6 +2198,35 @@ class DiscordAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.warning("Discord auto-register from COMMAND_REGISTRY failed: %s", e)
+
+        # ── Plugin-registered slash commands ──
+        # Plugins register via PluginContext.register_command(); we mirror
+        # those into Discord's native slash picker so users get the same
+        # autocomplete UX as for built-in commands. No per-platform plugin
+        # API needed — plugin commands are platform-agnostic.
+        try:
+            from hermes_cli.commands import _iter_plugin_command_entries
+
+            for plugin_name, plugin_desc, plugin_args_hint in _iter_plugin_command_entries():
+                discord_name = plugin_name.lower()[:32]
+                if discord_name in already_registered:
+                    continue
+                auto_cmd = _build_auto_slash_command(
+                    plugin_name,
+                    plugin_desc,
+                    plugin_args_hint,
+                )
+                try:
+                    tree.add_command(auto_cmd)
+                    already_registered.add(discord_name)
+                except Exception:
+                    # Silently skip commands that fail registration (e.g.
+                    # name conflict with a subcommand group).
+                    pass
+        except Exception as e:
+            logger.warning(
+                "Discord auto-register from plugin commands failed: %s", e
+            )
 
         # Register skills under a single /skill command group with category
         # subcommand groups.  This uses 1 top-level slot instead of N,
@@ -2962,6 +2993,17 @@ class DiscordAdapter(BasePlatformAdapter):
             parent_channel_id = self._get_parent_channel_id(message.channel)
 
         is_voice_linked_channel = False
+
+        # Save mention-stripped text before auto-threading since create_thread()
+        # can clobber message.content, breaking /command detection in channels.
+        raw_content = message.content.strip()
+        normalized_content = raw_content
+        mention_prefix = False
+        if self._client.user and self._client.user in message.mentions:
+            mention_prefix = True
+            normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
+            normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
             if parent_channel_id:
@@ -2999,13 +3041,8 @@ class DiscordAdapter(BasePlatformAdapter):
             in_bot_thread = is_thread and thread_id in self._threads
 
             if require_mention and not is_free_channel and not in_bot_thread:
-                if self._client.user not in message.mentions:
+                if self._client.user not in message.mentions and not mention_prefix:
                     return
-
-            if self._client.user and self._client.user in message.mentions:
-                message.content = message.content.replace(f"<@{self._client.user.id}>", "").strip()
-                message.content = message.content.replace(f"<@!{self._client.user.id}>", "").strip()
-
         # Auto-thread: when enabled, automatically create a thread for every
         # @mention in a text channel so each conversation is isolated (like Slack).
         # Messages already inside threads or DMs are unaffected.
@@ -3027,7 +3064,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
         # Determine message type
         msg_type = MessageType.TEXT
-        if message.content.startswith("/"):
+        if normalized_content.startswith("/"):
             msg_type = MessageType.COMMAND
         elif message.attachments:
             # Check attachment types
@@ -3167,7 +3204,9 @@ class DiscordAdapter(BasePlatformAdapter):
                                 att.filename, e, exc_info=True,
                             )
 
-        event_text = message.content
+        # Use normalized_content (saved before auto-threading) instead of message.content,
+        # to detect /slash commands in channel messages.
+        event_text = normalized_content
         if pending_text_injection:
             event_text = f"{pending_text_injection}\n\n{event_text}" if event_text else pending_text_injection
 
