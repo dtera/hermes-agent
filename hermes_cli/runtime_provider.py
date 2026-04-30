@@ -903,6 +903,7 @@ def resolve_runtime_provider(
         requested=requested,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     # ── 统一注入 extra_headers ──────────────────────────────────────────
     # 无论走哪条 provider 解析路径，都从 model 配置中读取 extra_headers
@@ -920,6 +921,7 @@ def _resolve_runtime_provider_core(
     requested: Optional[str] = None,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
