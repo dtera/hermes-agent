@@ -2735,6 +2735,41 @@ def _is_profile_api_key_provider(provider_id: str) -> bool:
         return False
 
 
+def _profile_has_custom_model_flow(provider_id: str) -> bool:
+    """Return True when provider_id maps to a profile that declares a bespoke
+    ``hermes model`` flow (overrides ``ProviderProfile.run_model_flow``).
+
+    Used as a catch-all in select_provider_and_model() so that a plugin
+    provider with custom picker UX (e.g. a url_template relay that prompts
+    for endpoint + per-model id, or lists models from a remote backend)
+    dispatches to its own flow without requiring an explicit elif branch.
+    """
+    try:
+        from providers import get_provider_profile
+        from providers.base import ProviderProfile
+        _p = get_provider_profile(provider_id)
+        if _p is None:
+            return False
+        _base_flow = getattr(ProviderProfile, "run_model_flow", None)
+        return _base_flow is not None and type(_p).run_model_flow is not _base_flow
+    except Exception:
+        return False
+
+
+def _model_flow_profile(config, provider_id, current_model=""):
+    """Dispatch to a provider profile's bespoke ``hermes model`` flow.
+
+    Delegates the entire provider-setup + model-selection + config-persist
+    flow to the plugin's ``ProviderProfile.run_model_flow`` so the logic
+    lives in the plugin, not in core.
+    """
+    from providers import get_provider_profile
+
+    _p = get_provider_profile(provider_id)
+    if _p is not None:
+        _p.run_model_flow(config=config, current_model=current_model)
+
+
 def select_provider_and_model(args=None):
     """Core provider selection + model picking logic.
 
@@ -3111,6 +3146,8 @@ def select_provider_and_model(args=None):
         _model_flow_bedrock(config, current_model)
     elif selected_provider == "azure-foundry":
         _model_flow_azure_foundry(config, current_model)
+    elif _profile_has_custom_model_flow(selected_provider):
+        _model_flow_profile(config, selected_provider, current_model)
     elif selected_provider in {
         "openai-api",
         "gemini",

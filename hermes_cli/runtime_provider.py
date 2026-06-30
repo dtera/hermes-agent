@@ -1498,6 +1498,34 @@ def resolve_runtime_provider(
         custom_runtime["requested_provider"] = requested_provider
         return custom_runtime
 
+    # Plugin provider profiles may declare a dynamic runtime resolver
+    # (e.g. a relay that builds base_url from a per-model url_template, or
+    # injects env-resolved auth headers). Consult the generic profile hook
+    # before the credential-pool / generic provider chain. No-op for
+    # built-in profiles, which return None and fall through unchanged.
+    try:
+        from providers import get_provider_profile as _get_provider_profile
+
+        _profile = _get_provider_profile(requested_provider)
+        if _profile is not None:
+            _profile_hook = getattr(_profile, "resolve_runtime", None)
+            if callable(_profile_hook):
+                _profile_runtime = _profile_hook(
+                    model_name=(target_model or "").strip(),
+                    model_cfg=_get_model_config(),
+                )
+                if _profile_runtime:
+                    _profile_runtime.setdefault(
+                        "requested_provider", requested_provider
+                    )
+                    return _profile_runtime
+    except Exception as _profile_exc:
+        logger.debug(
+            "provider profile resolve_runtime hook failed for %s: %s",
+            requested_provider,
+            _profile_exc,
+        )
+
     # If provider is "auto" (or unset) but config.yaml has an explicit base_url
     # pointing at a custom/local endpoint (e.g. Ollama at localhost:11434),
     # route through the OpenAI-compatible resolver instead of letting

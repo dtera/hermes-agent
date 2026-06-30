@@ -159,6 +159,61 @@ class ProviderProfile:
         """
         return self.default_max_tokens
 
+    def resolve_runtime(
+        self,
+        *,
+        model_name: str = "",
+        model_cfg: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Hook: dynamically resolve this provider's runtime connection.
+
+        Return a runtime dict — the same shape produced by
+        ``hermes_cli.runtime_provider.resolve_runtime_provider`` (keys:
+        ``provider``, ``api_mode``, ``base_url``, ``api_key`` and optionally
+        ``default_headers``) — to OVERRIDE the built-in resolution chain for
+        this provider, or ``None`` to defer to the generic chain.
+
+        Default: no-op (``None``). Most providers have a static ``base_url``
+        and api_key resolved from the env, and don't need this. Override it
+        for providers whose endpoint, credentials, or auth headers are not
+        static — e.g. a relay that builds ``base_url`` from a per-model
+        ``url_template``, or that injects custom auth headers resolved from
+        the environment at request time.
+
+        ``default_headers`` returned here is honored directly when building
+        auxiliary-task clients. The main agent client additionally falls
+        back to ``self.default_headers`` (see agent_init.py), so a profile
+        that needs the same headers there should also keep
+        ``self.default_headers`` in sync.
+
+        This is the generic plugin surface for dynamic providers: keep the
+        logic in the plugin's profile subclass, not in core resolution code.
+        """
+        return None
+
+    def run_model_flow(
+        self,
+        config: dict[str, Any] | None = None,
+        current_model: str = "",
+    ) -> bool:
+        """Hook: run a bespoke ``hermes model`` interactive selection flow.
+
+        Return ``True`` if this profile fully handled provider setup + model
+        selection (persisting config itself), or ``False`` to defer to the
+        generic api-key-provider flow. Default: no-op (``False``).
+
+        Providers whose model picker needs custom UX — e.g. a relay that
+        prompts for a ``url_template`` and per-model id, or that lists models
+        from a remote backends endpoint — override this so they can be
+        selected from ``hermes model`` without an explicit branch in core.
+
+        A profile that overrides this is automatically exposed in the
+        ``hermes model`` provider picker (see ``CANONICAL_PROVIDERS``
+        auto-extend in ``hermes_cli/models.py``) and dispatched here by
+        ``select_provider_and_model`` — no core edits per provider.
+        """
+        return False
+
     def fetch_models(
         self,
         *,

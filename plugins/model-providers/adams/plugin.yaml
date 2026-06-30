@@ -1,0 +1,5 @@
+name: adams-provider
+kind: model-provider
+version: 1.0.0
+description: Adams LLM Provider
+author: dterazhao
