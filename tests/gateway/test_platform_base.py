@@ -786,6 +786,28 @@ class TestMediaDeliveryPathValidation:
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(media_file)) == str(media_file.resolve())
 
+    def test_allows_stale_kanban_attachment_but_not_neighboring_workspace(
+        self, tmp_path, monkeypatch,
+    ):
+        """Strict mode trusts durable attachments without trusting scratch."""
+        self._patch_roots(monkeypatch)
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "hermes"))
+        monkeypatch.setenv("HERMES_MEDIA_TRUST_RECENT_FILES", "0")
+        board_root = tmp_path / "hermes" / "kanban" / "boards" / "research"
+        board_root.mkdir(parents=True)
+        (board_root / "kanban.db").touch()
+        attachment = board_root / "attachments" / "t_12345678" / "report.pdf"
+        scratch = board_root / "workspaces" / "t_12345678" / "notes.txt"
+        attachment.parent.mkdir(parents=True)
+        scratch.parent.mkdir(parents=True)
+        attachment.write_bytes(b"%PDF")
+        scratch.write_text("private", encoding="utf-8")
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(attachment)) == str(
+            attachment.resolve()
+        )
+        assert BasePlatformAdapter.validate_media_delivery_path(str(scratch)) is None
+
     def test_recency_trust_allows_freshly_produced_file(self, tmp_path, monkeypatch):
         """A PDF the agent just wrote to /tmp should be deliverable.
 
@@ -990,6 +1012,38 @@ class TestMediaDeliveryDefaultMode:
         )
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(env_file)) is None
+
+    @pytest.mark.parametrize(
+        "rel",
+        [
+            "mcp-tokens/github.json",
+            "mcp-tokens/github.client.json",
+            "mcp-tokens/github.meta.json",
+        ],
+    )
+    def test_denylist_blocks_mcp_oauth_tokens(self, tmp_path, monkeypatch, rel):
+        """Live MCP OAuth tokens/client creds under ~/.hermes/mcp-tokens/ must
+        never deliver as native media — same exfil class as auth.json/.env.
+        Sibling to the pairing/ directory denylist entry.
+        """
+        self._patch_roots(monkeypatch)
+
+        fake_home = tmp_path / "home"
+        hermes_dir = fake_home / ".hermes"
+        (hermes_dir / "mcp-tokens").mkdir(parents=True)
+        secret = hermes_dir / rel
+        secret.write_text('{"access_token": "live-bearer-abc123"}')
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_HOME",
+            hermes_dir,
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.base._HERMES_ROOT",
+            hermes_dir,
+        )
+
+        assert BasePlatformAdapter.validate_media_delivery_path(str(secret)) is None
 
     def test_denylist_blocks_hermes_config_in_active_profile(self, tmp_path, monkeypatch):
         """The active profile config stays blocked in default mode."""

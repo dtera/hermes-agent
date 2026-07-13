@@ -2,13 +2,14 @@ import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
-import { transcribeAudio } from '@/hermes'
+import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS, transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
 import { branchGroupForUser, type ChatMessage, chatMessageText, textPart } from '@/lib/chat-messages'
 import { pathLabel, SLASH_COMMAND_RE } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
 import { setMutableRef } from '@/lib/mutable-ref'
+import { normalize } from '@/lib/text'
 import { clearClarifyRequest } from '@/store/clarify'
 import {
   $composerAttachments,
@@ -157,9 +158,11 @@ interface PromptActionsOptions {
   busyRef: MutableRefObject<boolean>
   branchCurrentSession: () => Promise<boolean>
   createBackendSessionForSend: (preview?: string | null) => Promise<string | null>
+  getRouteToken: () => string
   handleSkinCommand: (arg: string) => string
+  openMemoryGraph: () => void
   refreshSessions: () => Promise<void>
-  requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  requestGateway: <T>(method: string, params?: Record<string, unknown>, timeoutMs?: number) => Promise<T>
   resumeStoredSession: (storedSessionId: string) => Promise<void> | void
   selectedStoredSessionIdRef: MutableRefObject<string | null>
   startFreshSessionDraft: () => void
@@ -184,7 +187,9 @@ export function usePromptActions({
   busyRef,
   branchCurrentSession,
   createBackendSessionForSend,
+  getRouteToken,
   handleSkinCommand,
+  openMemoryGraph,
   refreshSessions,
   requestGateway,
   resumeStoredSession,
@@ -351,6 +356,7 @@ export function usePromptActions({
     busyRef,
     copy,
     createBackendSessionForSend,
+    getRouteToken,
     requestGateway,
     selectedStoredSessionIdRef,
     syncAttachmentsForSubmit,
@@ -372,7 +378,7 @@ export function usePromptActions({
         return { error: copy.sessionUnavailable, ok: false }
       }
 
-      const target = platform.trim().toLowerCase()
+      const target = normalize(platform)
 
       if (!target) {
         return { error: copy.handoff.failed(''), ok: false }
@@ -447,6 +453,7 @@ export function usePromptActions({
     createBackendSessionForSend,
     handleSkinCommand,
     handoffSession,
+    openMemoryGraph,
     refreshSessions,
     requestGateway,
     resumeStoredSession,
@@ -542,7 +549,8 @@ export function usePromptActions({
       if (isSessionNotFoundError(err) && selectedStoredSessionIdRef.current) {
         try {
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-            session_id: selectedStoredSessionIdRef.current
+            session_id: selectedStoredSessionIdRef.current,
+            source: 'desktop'
           })
 
           const recoveredId = resumed?.session_id
@@ -665,11 +673,15 @@ export function usePromptActions({
       })
 
       try {
-        await requestGateway('prompt.submit', {
-          session_id: activeSessionId,
-          text: userText,
-          truncate_before_user_ordinal: truncateBeforeUserOrdinal
-        })
+        await requestGateway(
+          'prompt.submit',
+          {
+            session_id: activeSessionId,
+            text: userText,
+            truncate_before_user_ordinal: truncateBeforeUserOrdinal
+          },
+          PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+        )
       } catch (err) {
         updateSessionState(activeSessionId, state => ({
           ...state,
@@ -702,11 +714,15 @@ export function usePromptActions({
       }
 
       const submit = () =>
-        requestGateway('prompt.submit', {
-          session_id: sessionId,
-          text,
-          ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
-        })
+        requestGateway(
+          'prompt.submit',
+          {
+            session_id: sessionId,
+            text,
+            ...(truncateOrdinal !== undefined && { truncate_before_user_ordinal: truncateOrdinal })
+          },
+          PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
+        )
 
       if (interruptFirst) {
         await interrupt()
