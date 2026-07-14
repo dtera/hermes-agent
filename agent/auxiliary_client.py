@@ -4526,6 +4526,65 @@ def resolve_provider_client(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
         )
 
+    # ── Plugin provider profiles with a dynamic runtime resolver ─────
+    # Providers whose endpoint/credentials/headers are not static (e.g. a
+    # relay that builds base_url from a per-model url_template) expose a
+    # ProviderProfile.resolve_runtime() hook. Reuse the same runtime the
+    # main agent uses, then build a standard OpenAI-compatible aux client
+    # from it. No-op for built-in profiles (hook returns None).
+    if provider not in ("auto", "custom", "openrouter"):
+        try:
+            from providers import get_provider_profile as _get_provider_profile
+
+            _aux_profile = (
+                _get_provider_profile(provider)
+                or _get_provider_profile(original_provider)
+            )
+            if _aux_profile is not None and callable(
+                getattr(_aux_profile, "resolve_runtime", None)
+            ):
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                _aux_rt = resolve_runtime_provider(
+                    requested=provider, target_model=model
+                )
+                if isinstance(_aux_rt, dict) and str(
+                    _aux_rt.get("base_url") or ""
+                ).strip():
+                    _aux_base = str(_aux_rt["base_url"]).strip().rstrip("/")
+                    _aux_key = str(_aux_rt.get("api_key") or "").strip() or "no-key-required"
+                    _aux_headers = _aux_rt.get("default_headers") or {}
+                    _aux_mode = _aux_rt.get("api_mode")
+                    _clean_base, _dq = _extract_url_query_params(_aux_base)
+                    _aux_kwargs: Dict[str, Any] = {}
+                    if _dq:
+                        _aux_kwargs["default_query"] = _dq
+                    if _aux_headers:
+                        _aux_kwargs["default_headers"] = dict(_aux_headers)
+                    _aux_client = _create_openai_client(
+                        api_key=_aux_key, base_url=_clean_base, **_aux_kwargs
+                    )
+                    _aux_model = _normalize_resolved_model(
+                        model or _read_main_model(), provider
+                    )
+                    if _aux_mode == "codex_responses":
+                        _aux_client = CodexAuxiliaryClient(_aux_client, _aux_model)
+                    else:
+                        _aux_client = _wrap_if_needed(
+                            _aux_client, _aux_model, _aux_base, _aux_key
+                        )
+                    if async_mode:
+                        return _to_async_client(
+                            _aux_client, _aux_model, is_vision=is_vision
+                        )
+                    return _aux_client, _aux_model
+        except Exception as _aux_profile_exc:
+            logger.debug(
+                "Auxiliary client: profile runtime resolution failed for %s: %s",
+                provider,
+                _aux_profile_exc,
+            )
+
     # ── Auto: try all providers in priority order ────────────────────
     if provider == "auto":
         client, resolved = _resolve_auto(main_runtime=main_runtime, task=task)
